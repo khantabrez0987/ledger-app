@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../db_helper.dart';
+import '../models/bill.dart';
 import '../models/ledger_mode.dart';
 import '../models/ledger_transaction.dart';
 
@@ -39,6 +40,12 @@ class _AddEditTransactionScreenState extends State<AddEditTransactionScreen> {
   final db = DbHelper.instance;
   static const List<String> _paymentModes = ['CASH', 'NEFT', 'RTGS', 'CHQ'];
 
+  // New: Bill management fields
+  bool _applyToBill = false; // Toggle: apply to specific bill or auto-adjust
+  int? _selectedBillId; // Selected bill ID for payment
+  List<Bill> _availableBills = []; // Bills available for payment
+  late Future<void> _loadBillsFuture;
+
   List<String> get _availablePaymentModes {
     final currentValue = _paymentModeController.text.trim();
     if (currentValue.isEmpty || _paymentModes.contains(currentValue)) {
@@ -76,6 +83,9 @@ class _AddEditTransactionScreenState extends State<AddEditTransactionScreen> {
   @override
   void initState() {
     super.initState();
+    // Load unpaid/partial bills for this company
+    _loadBillsFuture = _loadUnpaidBills();
+    
     final tx = widget.transaction;
     if (tx != null) {
       _selectedType = _normalizeType(tx.type);
@@ -94,6 +104,27 @@ class _AddEditTransactionScreenState extends State<AddEditTransactionScreen> {
       _selectedPaymentMode = 'CASH';
     }
     _dateController.text = DateFormat.yMMMd().format(_selectedDate);
+  }
+
+  /// Load unpaid and partially paid bills for this company
+  Future<void> _loadUnpaidBills() async {
+    try {
+      final unpaidBills = await db.getUnpaidBills(
+        widget.companyName,
+        mode: widget.ledgerMode,
+      );
+      final partialBills = await db.getPartiallyPaidBills(
+        widget.companyName,
+        mode: widget.ledgerMode,
+      );
+      if (mounted) {
+        setState(() {
+          _availableBills = [...unpaidBills, ...partialBills];
+        });
+      }
+    } catch (e) {
+      // Silent fail - bills loading is optional
+    }
   }
 
   @override
@@ -174,71 +205,128 @@ class _AddEditTransactionScreenState extends State<AddEditTransactionScreen> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _saving = true);
 
-    final amount = double.tryParse(_amountController.text.trim()) ?? 0;
-    final dateValue = _parseDate(_dateController.text.trim()) ?? _selectedDate;
-    final transaction = LedgerTransaction(
-      id: widget.transaction?.id,
-      company: widget.companyName,
-      ledgerMode: widget.ledgerMode,
-      type: _selectedType,
-      amount: amount,
-      category: _categoryController.text.trim(),
-      note: _noteController.text.trim(),
-      paymentMode: _paymentModeController.text.trim(),
-      fileNumber: widget.transaction?.fileNumber ?? '',
-      invoiceNumber: _invoiceNumberController.text.trim(),
-      isCleared: _isCleared,
-      date: dateValue,
-    );
+    try {
+      final amount = double.tryParse(_amountController.text.trim()) ?? 0;
+      final dateValue = _parseDate(_dateController.text.trim()) ?? _selectedDate;
+      final transaction = LedgerTransaction(
+        id: widget.transaction?.id,
+        company: widget.companyName,
+        ledgerMode: widget.ledgerMode,
+        type: _selectedType,
+        amount: amount,
+        category: _categoryController.text.trim(),
+        note: _noteController.text.trim(),
+        paymentMode: _paymentModeController.text.trim(),
+        fileNumber: widget.transaction?.fileNumber ?? '',
+        invoiceNumber: _invoiceNumberController.text.trim(),
+        isCleared: _isCleared,
+        date: dateValue,
+      );
 
-    Future<void> syncInvoiceClearStatus(
-        String invoiceNumber, bool isCleared) async {
-      if (invoiceNumber.trim().isEmpty) {
-        return;
+      Future<void> syncInvoiceClearStatus(
+          String invoiceNumber, bool isCleared) async {
+        if (invoiceNumber.trim().isEmpty) {
+          return;
+        }
+        await db.updateInvoiceClearStatus(
+          companyName: widget.companyName,
+          invoiceNumber: invoiceNumber,
+          isCleared: isCleared,
+          mode: widget.ledgerMode,
+        );
       }
-      await db.updateInvoiceClearStatus(
-        companyName: widget.companyName,
-        invoiceNumber: invoiceNumber,
-        isCleared: isCleared,
-        mode: widget.ledgerMode,
-      );
-    }
 
-    if (widget.transaction == null && transaction.invoiceNumber.isNotEmpty) {
-      final existing = await db.getTransactionByInvoiceNumber(
-        widget.companyName,
-        transaction.invoiceNumber,
-        mode: widget.ledgerMode,
-      );
-      if (existing != null) {
-        final action = await _showExistingTransactionDialog(existing);
-        if (action == _TransactionSaveAction.updateExisting) {
-          await db.updateTransaction(transaction.copyWith(id: existing.id));
-          await syncInvoiceClearStatus(
-              transaction.invoiceNumber, transaction.isCleared);
-        } else if (action == _TransactionSaveAction.saveNew) {
+      if (widget.transaction == null && transaction.invoiceNumber.isNotEmpty) {
+        final existing = await db.getTransactionByInvoiceNumber(
+          widget.companyName,
+          transaction.invoiceNumber,
+          mode: widget.ledgerMode,
+        );
+        if (existing != null) {
+          final action = await _showExistingTransactionDialog(existing);
+          if (action == _TransactionSaveAction.updateExisting) {
+            await db.updateTransaction(transaction.copyWith(id: existing.id));
+            await syncInvoiceClearStatus(
+                transaction.invoiceNumber, transaction.isCleared);
+          } else if (action == _TransactionSaveAction.saveNew) {
+            await db.addTransaction(transaction);
+            await syncInvoiceClearStatus(
+                transaction.invoiceNumber, transaction.isCleared);
+          }
+        } else {
           await db.addTransaction(transaction);
           await syncInvoiceClearStatus(
               transaction.invoiceNumber, transaction.isCleared);
         }
-      } else {
+      } else if (widget.transaction == null) {
         await db.addTransaction(transaction);
         await syncInvoiceClearStatus(
             transaction.invoiceNumber, transaction.isCleared);
+      } else {
+        await db.updateTransaction(transaction);
+        await syncInvoiceClearStatus(
+            transaction.invoiceNumber, transaction.isCleared);
       }
-    } else if (widget.transaction == null) {
-      await db.addTransaction(transaction);
-      await syncInvoiceClearStatus(
-          transaction.invoiceNumber, transaction.isCleared);
-    } else {
-      await db.updateTransaction(transaction);
-      await syncInvoiceClearStatus(
-          transaction.invoiceNumber, transaction.isCleared);
-    }
 
-    if (mounted) {
-      setState(() => _saving = false);
-      Navigator.of(context).pop(true);
+      // NEW: Handle bill payment logic if this is a payment (credit/income type)
+      if (_selectedType == 'credit' && amount > 0) {
+        if (_applyToBill && _selectedBillId != null) {
+          // Apply payment to specific bill
+          try {
+            await db.applyPaymentToBill(
+              billId: _selectedBillId!,
+              paymentAmount: amount,
+              paymentMode: _paymentModeController.text.trim(),
+              notes: _noteController.text.trim(),
+            );
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Payment applied to bill')),
+              );
+            }
+          } catch (e) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Error: ${e.toString()}')),
+              );
+            }
+          }
+        } else if (_availableBills.isNotEmpty) {
+          // Auto-adjust payment to oldest unpaid bills (FIFO)
+          try {
+            final billsReceivingPayment = await db.autoAdjustPayment(
+              companyName: widget.companyName,
+              paymentAmount: amount,
+              paymentMode: _paymentModeController.text.trim(),
+              notes: _noteController.text.trim(),
+              mode: widget.ledgerMode,
+            );
+            if (mounted && billsReceivingPayment.isNotEmpty) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    'Payment auto-adjusted to ${billsReceivingPayment.length} bill(s)',
+                  ),
+                ),
+              );
+            }
+          } catch (e) {
+            // Auto-adjust is optional, continue even if it fails
+          }
+        }
+      }
+
+      if (mounted) {
+        setState(() => _saving = false);
+        Navigator.of(context).pop(true);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _saving = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: ${e.toString()}')),
+        );
+      }
     }
   }
 
@@ -410,7 +498,83 @@ class _AddEditTransactionScreenState extends State<AddEditTransactionScreen> {
                 ),
               ),
               const SizedBox(height: 24),
-              FilledButton(
+              // NEW: Bill Payment Options (only for credit/payment transactions)
+              if (_selectedType == 'credit' && _availableBills.isNotEmpty) ...[
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.blue.shade200),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Bill Payment Options',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('Apply to specific bill'),
+                        subtitle: const Text(
+                          'Uncheck to auto-adjust to oldest unpaid bills',
+                        ),
+                        value: _applyToBill,
+                        onChanged: (value) {
+                          setState(() {
+                            _applyToBill = value;
+                            if (!value) {
+                              _selectedBillId = null;
+                            }
+                          });
+                        },
+                      ),
+                      if (_applyToBill) ...[
+                        const SizedBox(height: 8),
+                        DropdownButtonFormField<int?>(
+                          value: _selectedBillId,
+                          items: _availableBills
+                              .map(
+                                (bill) => DropdownMenuItem(
+                                  value: bill.id,
+                                  child: Text(
+                                    '${bill.billId} - ₹${bill.remainingAmount.toStringAsFixed(2)} due',
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                          decoration: const InputDecoration(
+                            labelText: 'Select Bill',
+                            border: OutlineInputBorder(),
+                            contentPadding: EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 8,
+                            ),
+                          ),
+                          onChanged: (value) {
+                            setState(() {
+                              _selectedBillId = value;
+                            });
+                          },
+                          validator: (value) {
+                            if (_applyToBill && value == null) {
+                              return 'Please select a bill';
+                            }
+                            return null;
+                          },
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+              ],
+              const SizedBox(height: 24),
                 onPressed: _saving ? null : _saveTransaction,
                 child: _saving
                     ? const CircularProgressIndicator()

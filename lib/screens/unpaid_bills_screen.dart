@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../db_helper.dart';
+import '../models/bill.dart';
 import '../models/company.dart';
 import '../models/ledger_mode.dart';
 import '../models/ledger_transaction.dart';
@@ -16,7 +17,10 @@ class UnpaidBillsScreen extends StatefulWidget {
 
 class _UnpaidBillsScreenState extends State<UnpaidBillsScreen> {
   final db = DbHelper.instance;
-  late Future<List<MapEntry<Company, List<LedgerTransaction>>>> _billsFuture;
+  late Future<({
+    List<MapEntry<Company, List<LedgerTransaction>>> transactions,
+    List<MapEntry<Company, List<Bill>>> bills,
+  })> _billsFuture;
 
   @override
   void initState() {
@@ -28,24 +32,41 @@ class _UnpaidBillsScreenState extends State<UnpaidBillsScreen> {
     _billsFuture = _fetchUnpaidBillsByCompany();
   }
 
-  Future<List<MapEntry<Company, List<LedgerTransaction>>>>
-      _fetchUnpaidBillsByCompany() async {
+  Future<({
+    List<MapEntry<Company, List<LedgerTransaction>>> transactions,
+    List<MapEntry<Company, List<Bill>>> bills,
+  })> _fetchUnpaidBillsByCompany() async {
     final companies = await db.getCompanies(mode: widget.mode);
-    final result = <MapEntry<Company, List<LedgerTransaction>>>[];
+    final transactionResult = <MapEntry<Company, List<LedgerTransaction>>>[];
+    final billResult = <MapEntry<Company, List<Bill>>>[];
 
     for (final company in companies) {
+      // Fetch unpaid transactions with invoices
       final transactions =
           await db.getTransactions(company.name, mode: widget.mode);
       final unpaidWithInvoice = transactions
           .where((tx) => !tx.isCleared && tx.invoiceNumber.isNotEmpty)
           .toList();
-
       if (unpaidWithInvoice.isNotEmpty) {
-        result.add(MapEntry(company, unpaidWithInvoice));
+        transactionResult.add(MapEntry(company, unpaidWithInvoice));
+      }
+
+      // Fetch unpaid and partially paid bills
+      final unpaidBills = await db.getUnpaidBills(
+        company.name,
+        mode: widget.mode,
+      );
+      final partialBills = await db.getPartiallyPaidBills(
+        company.name,
+        mode: widget.mode,
+      );
+      final allUnpaidBills = [...unpaidBills, ...partialBills];
+      if (allUnpaidBills.isNotEmpty) {
+        billResult.add(MapEntry(company, allUnpaidBills));
       }
     }
 
-    return result;
+    return (transactions: transactionResult, bills: billResult);
   }
 
   Future<void> _markAsPaid(
@@ -96,16 +117,26 @@ class _UnpaidBillsScreenState extends State<UnpaidBillsScreen> {
             end: Alignment.bottomCenter,
           ),
         ),
-        child: FutureBuilder<List<MapEntry<Company, List<LedgerTransaction>>>>(
+        child: FutureBuilder<({
+          List<MapEntry<Company, List<LedgerTransaction>>> transactions,
+          List<MapEntry<Company, List<Bill>>> bills,
+        })>(
           future: _billsFuture,
           builder: (context, snapshot) {
             if (snapshot.connectionState != ConnectionState.done) {
               return const Center(child: CircularProgressIndicator());
             }
 
-            final billsByCompany = snapshot.data ?? [];
+            final data = snapshot.data;
+            if (data == null) {
+              return const Center(child: Text('Error loading bills'));
+            }
 
-            if (billsByCompany.isEmpty) {
+            final billsByCompany = data.transactions;
+            final billRecords = data.bills;
+            final isEmpty = billsByCompany.isEmpty && billRecords.isEmpty;
+
+            if (isEmpty) {
               return Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -123,7 +154,7 @@ class _UnpaidBillsScreenState extends State<UnpaidBillsScreen> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      'All invoices are paid.',
+                      'All invoices and bills are paid.',
                       style: TextStyle(color: Colors.grey.shade700),
                     ),
                   ],
@@ -131,6 +162,7 @@ class _UnpaidBillsScreenState extends State<UnpaidBillsScreen> {
               );
             }
 
+            // Calculate total outstanding from both sources
             double totalUnpaid = 0;
             for (final entry in billsByCompany) {
               for (final tx in entry.value) {
@@ -141,6 +173,11 @@ class _UnpaidBillsScreenState extends State<UnpaidBillsScreen> {
                 } else {
                   totalUnpaid -= tx.amount;
                 }
+              }
+            }
+            for (final entry in billRecords) {
+              for (final bill in entry.value) {
+                totalUnpaid += bill.remainingAmount;
               }
             }
 
@@ -174,6 +211,7 @@ class _UnpaidBillsScreenState extends State<UnpaidBillsScreen> {
                   ),
                 ),
                 const SizedBox(height: 16),
+                // Display transaction-based invoices
                 ...billsByCompany.map((entry) {
                   final company = entry.key;
                   final bills = entry.value;
@@ -281,6 +319,134 @@ class _UnpaidBillsScreenState extends State<UnpaidBillsScreen> {
                                       ),
                                       icon: const Icon(Icons.check, size: 16),
                                       label: const Text('Paid'),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ],
+                  );
+                }).toList(),
+                // Display new Bill records
+                ...billRecords.map((entry) {
+                  final company = entry.key;
+                  final bills = entry.value;
+                  final companyBillTotal =
+                      bills.fold<double>(0, (sum, bill) => sum + bill.remainingAmount);
+
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (billsByCompany.where((e) => e.key.name == company.name).isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(left: 8, bottom: 8),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                company.name,
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Outstanding: ${_formatAmount(companyBillTotal)}',
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  color: Colors.grey.shade700,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ...bills.map((bill) {
+                        final statusColor = bill.status == BillStatus.paid
+                            ? Colors.green
+                            : bill.status == BillStatus.partial
+                                ? Colors.orange
+                                : Colors.red;
+
+                        return Card(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: Row(
+                              children: [
+                                CircleAvatar(
+                                  backgroundColor: statusColor.withOpacity(0.2),
+                                  child: Icon(
+                                    Icons.inventory_2,
+                                    color: statusColor,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'Bill: ${bill.billId}',
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        '${DateFormat('d MMM y').format(bill.date)} • ${_daysAgoLabel(bill.date)}',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.grey.shade700,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      LinearProgressIndicator(
+                                        value: bill.percentagePaid / 100,
+                                        minHeight: 6,
+                                        backgroundColor: Colors.grey.shade300,
+                                        valueColor:
+                                            AlwaysStoppedAnimation<Color>(
+                                          statusColor,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        'Paid: ${bill.percentagePaid.toStringAsFixed(1)}% (₹${bill.paidAmount.toStringAsFixed(2)})',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          color: Colors.grey.shade600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    Text(
+                                      'Due: ${_formatAmount(bill.remainingAmount)}',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      'Total: ${_formatAmount(bill.totalAmount)}',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: Colors.grey.shade600,
+                                      ),
                                     ),
                                   ],
                                 ),
