@@ -1,0 +1,37 @@
+name: kamran_ledger
+description: A simple offline desktop ledger app for macOS.
+publish_to: none
+version: 3.0.0+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  pdf: ^3.11.1
+  sqflite_common_ffi: ^2.4.0
+  path_provider: ^2.0.15
+  path: ^1.8.4
+  intl: ^0.20.2
+  share_plus: ^10.0.15
+  open_filex: ^4.7.0
+  url_launcher: ^6.1.10
+
+hooks:
+  user_defines:
+    sqlite3:
+      source: system
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/company_logo.png
+    - assets/images/pdf_logo.png
